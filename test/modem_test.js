@@ -245,4 +245,68 @@ describe('Modem', function () {
     assert.strictEqual(modem.sshOptions.agent, '/var/lib/sock');
     assert.strictEqual(modem.sshOptions.foo, 'bar');
   });
+
+  // Dials a hijacked stdin request against a server that upgrades it, then
+  // reports the request headers and every byte sent before the upgrade.
+  function dialHijacked(dialOptions) {
+    return new Promise(function (resolve, reject) {
+      var server = http.createServer();
+      server.on('upgrade', function (req, socket, head) {
+        // A body sent with the upgrade request may arrive on the request
+        // stream or on the socket, so collect both.
+        var received = head;
+        var collect = function (chunk) {
+          received = Buffer.concat([received, chunk]);
+        };
+        req.on('data', collect);
+        socket.on('data', collect);
+        socket.write(
+          'HTTP/1.1 101 UPGRADED\r\n' +
+          'Content-Type: application/vnd.docker.raw-stream\r\n' +
+          'Connection: Upgrade\r\n' +
+          'Upgrade: tcp\r\n' +
+          '\r\n'
+        );
+        // Give any body bytes a chance to arrive before reporting.
+        setTimeout(function () {
+          socket.destroy();
+          server.close();
+          resolve({ headers: req.headers, body: received.toString() });
+        }, 100);
+      });
+      server.on('error', reject);
+      server.listen(0, '127.0.0.1', function () {
+        var modem = new Modem({ host: '127.0.0.1', port: server.address().port, protocol: 'http' });
+        modem.dial(Object.assign({
+          method: 'POST',
+          isStream: true,
+          hijack: true,
+          openStdin: true,
+          statusCodes: { 200: true }
+        }, dialOptions), function () {});
+      });
+    });
+  }
+
+  it('should not write attach options to the stdin of a hijacked request', async function () {
+    var result = await dialHijacked({
+      path: '/containers/abc/attach?',
+      options: { stream: true, stdout: true, stderr: true, stdin: true, hijack: true }
+    });
+
+    assert.strictEqual(result.body, '');
+    assert.strictEqual(result.headers['content-length'], undefined);
+  });
+
+  it('should still send the exec start body of a hijacked request', async function () {
+    var options = { Detach: false, Tty: true, stdin: true, hijack: true };
+    var result = await dialHijacked({
+      path: '/exec/abc/start',
+      allowEmpty: true,
+      options: options
+    });
+
+    assert.deepStrictEqual(JSON.parse(result.body), options);
+    assert.strictEqual(result.headers['content-length'], String(Buffer.byteLength(result.body)));
+  });
 });
